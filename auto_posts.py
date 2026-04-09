@@ -1,10 +1,13 @@
 """
-auto_posts.py — Fully Automatic WordPress Post Creator (v17)
+auto_posts.py — Fully Automatic WordPress Post Creator (v19)
 ============================================================
-Changes from v16:
-  ✅ Removed Google Indexing API completely — sitemap handles indexing
-  ✅ Removed service_account.json dependency
-  ✅ Cleaner and simpler code
+Changes from v18:
+  ✅ Keywords used EXACTLY as written — no Google Autocomplete expansion
+  ✅ Each seed keyword in keywords.txt creates POSTS_PER_RUN posts
+  ✅ Title picks a random template from title_templates.txt (keyword unchanged)
+  ✅ Subheading 1 is always the exact keyword (title-cased)
+  ✅ Subheadings 2–5 still come from Google Autocomplete / fallbacks
+  ✅ Keyword saved to used_keywords.txt only once (not once per post)
 
 File structure:
   auto_posts.py              ← this script
@@ -28,7 +31,7 @@ from datetime import datetime, timedelta
 # CONFIGURATION
 # ============================================================
 
-WP_URL             = "https://blixverse.com/wp-json/wp/v2"
+WP_URL             = "https://blixverse.com//wp-json/wp/v2"
 USERNAME           = os.environ.get("WP_USERNAME", "your_wp_username")
 APP_PASSWORD       = os.environ.get("WP_APP_PASSWORD", "your_app_password")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "your_token")
@@ -37,10 +40,26 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "your_chat_id")
 # --- Post settings ---
 POSTS_PER_RUN      = 2            # change to 10 for production
 IMAGES_PER_HEADING = 10           # images per heading
-POST_STATUS        = "draft"    # publish instantly
+POST_STATUS        = "draft"      # ← TEST MODE: saving as draft (change back to "publish" for production)
 
-# --- Gap between posts ---
-POST_GAP_SECONDS   = 10           # change to 7200 for 2 hour gap in production
+# --- Random gap options (in seconds) ---
+# Script picks ONE randomly at startup and uses it for ALL gaps in that run.
+# Options: 30 min, 45 min, 60 min, 75 min, 90 min, 105 min, 120 min
+POST_GAP_OPTIONS_SECONDS = [
+    30 * 60,    # 30 minutes
+    45 * 60,    # 45 minutes
+    60 * 60,    # 1 hour
+    75 * 60,    # 1 hour 15 minutes
+    90 * 60,    # 1 hour 30 minutes
+    105 * 60,   # 1 hour 45 minutes
+    120 * 60,   # 2 hours
+]
+
+# --- Random startup sleep range (seconds) ---
+# Adds extra unpredictability on top of the varied cron times.
+# This is SEPARATE from the post gap and only skipped with --skip-sleep.
+STARTUP_SLEEP_MIN = 0           # minimum extra sleep at startup
+STARTUP_SLEEP_MAX = 30 * 60     # maximum extra sleep at startup (30 minutes)
 
 # --- Slug variation words (tried in order if base slug already exists) ---
 SLUG_VARIATIONS = ["hd", "4k", "new", "latest", "best", "images", "3d"]
@@ -76,12 +95,14 @@ AUTH = (USERNAME, APP_PASSWORD)
 
 class RunStats:
     def __init__(self):
-        self.start_time    = datetime.now()
-        self.posts_created = []   # list of dicts
-        self.posts_failed  = []   # list of keywords
-        self.posts_skipped = []   # list of dicts {keyword, reason}
-        self.keywords_used = []
-        self.dry_run       = False
+        self.start_time     = datetime.now()
+        self.posts_created  = []
+        self.posts_failed   = []
+        self.posts_skipped  = []
+        self.keywords_used  = []
+        self.dry_run        = False
+        self.gap_seconds    = 0    # chosen gap for this run
+        self.startup_sleep  = 0    # actual startup sleep used
 
     def elapsed(self):
         delta = datetime.now() - self.start_time
@@ -94,6 +115,22 @@ class RunStats:
 
 
 STATS = RunStats()
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def seconds_to_human(seconds):
+    """Convert seconds to a human-readable string like '1h 30m' or '45m'."""
+    hours = int(seconds // 3600)
+    mins  = int((seconds % 3600) // 60)
+    if hours > 0 and mins > 0:
+        return f"{hours}h {mins}m"
+    elif hours > 0:
+        return f"{hours}h"
+    else:
+        return f"{mins}m"
 
 
 # ============================================================
@@ -180,13 +217,15 @@ def send_telegram(message):
 
 
 def build_telegram_summary(stats):
-    run_date = stats.start_time.strftime("%d %b %Y, %I:%M %p IST")
-    mode     = "🔍 DRY RUN" if stats.dry_run else "🚀 LIVE RUN"
+    run_date  = stats.start_time.strftime("%d %b %Y, %I:%M %p IST")
+    mode      = "🔍 DRY RUN" if stats.dry_run else "🚀 LIVE RUN"
+    gap_human = seconds_to_human(stats.gap_seconds)
 
     lines = [
         "<b>🤖 Auto Posts Report</b>",
         f"<b>Date:</b> {run_date}",
         f"<b>Mode:</b> {mode}",
+        f"<b>Gap Used:</b> {gap_human}",
         f"<b>Time Taken:</b> {stats.elapsed()}",
         "",
         "<b>📊 Summary</b>",
@@ -220,7 +259,7 @@ def build_telegram_summary(stats):
         lines.append("")
 
     lines.append("─────────────────────")
-    lines.append("<i>unityimage.com | Auto Posts v17</i>")
+    lines.append("<i>blixverse.com | Auto Posts v18</i>")
 
     return "\n".join(lines)
 
@@ -292,25 +331,21 @@ def collect_keywords(used_keywords):
         log("  No seed keywords found in keywords.txt")
         return []
 
+    # Use each seed keyword exactly as written — no autocomplete expansion.
+    # Each seed is repeated POSTS_PER_RUN times so the main loop can create
+    # that many posts for it. Seeds already used are skipped.
     all_kws = []
     for seed in seeds:
-        suggestions = fetch_autocomplete(seed)
-        log(f"  Seed '{seed}' → {len(suggestions)} suggestions")
-        all_kws.extend(suggestions)
-        time.sleep(0.5)
+        if seed.lower() in used_keywords:
+            log(f"  Seed '{seed}' already used — skipping")
+            continue
+        for _ in range(POSTS_PER_RUN):
+            all_kws.append(seed)
 
-    all_kws.extend(seeds)
+    fresh = [kw for kw in all_kws if len(kw.split()) >= 1]
+    log(f"  Total keyword slots available: {len(fresh)} ({len(seeds)} seeds × {POSTS_PER_RUN} posts each)")
 
-    seen, unique = set(), []
-    for kw in all_kws:
-        if kw not in seen:
-            seen.add(kw)
-            unique.append(kw)
-
-    fresh = [kw for kw in unique if kw not in used_keywords and len(kw.split()) >= 3]
-    log(f"  Total fresh keywords available: {len(fresh)}")
-
-    check_keywords_low(len(fresh))
+    check_keywords_low(len([s for s in seeds if s.lower() not in used_keywords]))
 
     return fresh
 
@@ -339,13 +374,9 @@ def title_case_keyword(kw):
 # ============================================================
 
 def build_clean_slug(kw):
-    # Remove emojis and non-ASCII
     text = re.sub(r'[^\x00-\x7F]+', '', kw.lower())
-    # Remove special characters
     text = re.sub(r'[^\w\s]', '', text)
-    # Remove standalone numbers
     text = re.sub(r'\b\d+\b', '', text)
-    # Filter remove words
     words = [w for w in text.split() if w and w not in SLUG_REMOVE_WORDS]
     slug  = "-".join(words).strip("-")
     return slug
@@ -462,23 +493,33 @@ def generate_meta_description(keyword):
 
 def fetch_subheadings_from_google(keyword, count=5):
     log(f"  Fetching subheadings from Google for: '{keyword}'")
+
+    pretty_kw = title_case_keyword(keyword)
+
+    # Subheading 1 is always the exact keyword — no autocomplete
+    result = [pretty_kw]
+    log(f"  Subheading 1 (exact keyword): '{pretty_kw}'")
+
+    # Remaining subheadings (2 onwards) come from Google Autocomplete
+    remaining = count - 1
     suggestions = fetch_autocomplete(keyword)
 
-    result = []
     for s in suggestions:
-        result.append(title_case_keyword(s))
+        candidate = title_case_keyword(s)
+        if candidate != pretty_kw and candidate not in result:
+            result.append(candidate)
         if len(result) >= count:
             break
 
-    log(f"  Google returned {len(result)} subheading suggestions")
+    log(f"  Google returned {len(result) - 1} additional subheading suggestions")
 
+    # Fill any remaining slots with fallbacks
     if len(result) < count:
         fallback_sets = load_subheading_fallbacks()
         if not fallback_sets:
             fallback_sets = [["Stylish", "Cute", "Aesthetic", "Attitude", "Sad"]]
 
         modifier_set = random.choice(fallback_sets)
-        pretty_kw    = title_case_keyword(keyword)
 
         for mod in modifier_set:
             if len(result) >= count:
@@ -709,21 +750,47 @@ def create_wp_post(title, slug, content, category_id, focus_kw, meta_desc):
 # MAIN PIPELINE
 # ============================================================
 
-def run(posts_to_create=POSTS_PER_RUN, dry_run=False):
+def run(posts_to_create=POSTS_PER_RUN, dry_run=False, skip_sleep=False):
     STATS.dry_run = dry_run
 
+    # ── Pick a random gap for this run ────────────────────────
+    # NOTE: gap is ALWAYS applied regardless of dry_run or skip_sleep.
+    # --skip-sleep only controls the startup delay, never the post gap.
+    gap_seconds       = 0   # ← TEST MODE: no delay between posts (restore random.choice(POST_GAP_OPTIONS_SECONDS) for production)
+    STATS.gap_seconds = gap_seconds
+    gap_human         = seconds_to_human(gap_seconds)
+
     log("=" * 60)
-    log(f"Auto Posts v17 | target={posts_to_create} posts | dry_run={dry_run}")
-    log(f"Gap between posts: {POST_GAP_SECONDS}s")
+    log(f"Auto Posts v18 | target={posts_to_create} posts | dry_run={dry_run} | skip_sleep={skip_sleep}")
+    log(f"Gap between posts this run: {gap_human} ({gap_seconds}s) — chosen randomly")
+    log(f"NOTE: Post gap is ALWAYS applied. --skip-sleep only skips startup delay.")
     log("=" * 60)
+
+    # ── Random startup sleep ──────────────────────────────────
+    # Only skipped when --skip-sleep is passed (e.g. manual runs).
+    # NEVER affects the gap between posts.
+    if skip_sleep:
+        startup_sleep = 0
+        log("  Startup sleep: SKIPPED (--skip-sleep flag)")
+    else:
+        startup_sleep        = random.randint(STARTUP_SLEEP_MIN, STARTUP_SLEEP_MAX)
+        STATS.startup_sleep  = startup_sleep
+        sleep_human          = seconds_to_human(startup_sleep)
+        wake_time            = datetime.now() + timedelta(seconds=startup_sleep)
+        log(f"  Startup sleep: {sleep_human} — waking at {wake_time.strftime('%I:%M %p')}")
 
     send_telegram(
         f"🚀 <b>Auto Posts Started</b>\n"
         f"Mode: {'DRY RUN' if dry_run else 'LIVE'}\n"
         f"Target: {posts_to_create} post(s)\n"
-        f"Gap: {POST_GAP_SECONDS} seconds between each post\n"
+        f"Gap Between Posts: <b>{gap_human}</b> (random — always applied)\n"
+        f"Startup Sleep: {'None (skipped)' if startup_sleep == 0 else seconds_to_human(startup_sleep)}\n"
         f"Time: {STATS.start_time.strftime('%d %b %Y, %I:%M %p')}"
     )
+
+    if startup_sleep > 0:
+        time.sleep(startup_sleep)
+        log(f"  Startup sleep done. Actual start: {datetime.now().strftime('%I:%M %p')}")
 
     used_keywords = load_used_keywords()
     log(f"Loaded {len(used_keywords)} already-used keywords")
@@ -770,13 +837,15 @@ def run(posts_to_create=POSTS_PER_RUN, dry_run=False):
             return
     else:
         all_media = [
-            {"id": i, "source_url": f"https://unityimage.com/wp-content/img{i}.jpg", "alt_text": "girl dp"}
+            {"id": i, "source_url": f"https://blixverse.com/wp-content/img{i}.jpg", "alt_text": "girl dp"}
             for i in range(1, 500)
         ]
 
     existing_titles = fetch_existing_titles() if not dry_run else set()
 
     # ── Main loop ─────────────────────────────────────────────
+    saved_keywords_this_run = set()   # track which seeds we've already saved
+
     for i, kw in enumerate(selected):
         log(f"\n--- Post {i+1}/{len(selected)} | Keyword: '{kw}' ---")
 
@@ -831,7 +900,7 @@ def run(posts_to_create=POSTS_PER_RUN, dry_run=False):
 
             STATS.posts_created.append({
                 "title":        title,
-                "link":         f"https://unityimage.com/{slug}/",
+                "link":         f"https://blixverse.com/{slug}/",
                 "category":     cat_name,
                 "keyword":      kw,
                 "published_at": datetime.now().strftime("%d %b %Y %I:%M %p"),
@@ -846,7 +915,10 @@ def run(posts_to_create=POSTS_PER_RUN, dry_run=False):
                 published_at = datetime.now().strftime("%d %b %Y %I:%M %p")
                 log(f"  ✓ Published! ID={post_id} | Slug={slug} | {published_at}")
                 log(f"  ✓ URL: {post_link}")
-                save_used_keyword(kw)
+                # Only save to used_keywords.txt once per unique seed keyword
+                if kw.lower() not in saved_keywords_this_run:
+                    save_used_keyword(kw)
+                    saved_keywords_this_run.add(kw.lower())
                 existing_titles.add(title.strip().lower())
 
                 STATS.posts_created.append({
@@ -861,15 +933,14 @@ def run(posts_to_create=POSTS_PER_RUN, dry_run=False):
                 log(f"  ✗ Failed to create post for '{kw}'")
                 STATS.posts_failed.append(kw)
 
-        # Wait between posts
+        # ── Gap between posts ─────────────────────────────────
+        # Applied after EVERY post except the last one.
+        # ALWAYS waits the full gap — skip_sleep has NO effect here.
         if i < len(selected) - 1:
-            if dry_run:
-                log(f"  [DRY RUN] Would wait {POST_GAP_SECONDS} seconds before next post")
-            else:
-                next_post_time = datetime.now() + timedelta(seconds=POST_GAP_SECONDS)
-                log(f"  ⏳ Waiting {POST_GAP_SECONDS} seconds before next post...")
-                log(f"  ⏳ Next post at: {next_post_time.strftime('%d %b %Y %I:%M %p')}")
-                time.sleep(POST_GAP_SECONDS)
+            next_post_time = datetime.now() + timedelta(seconds=gap_seconds)
+            log(f"  ⏳ Waiting {gap_human} ({gap_seconds}s) before next post...")
+            log(f"  ⏳ Next post at: {next_post_time.strftime('%d %b %Y %I:%M %p')}")
+            time.sleep(gap_seconds)   # ← always runs, no condition
 
     # ── Final Summary ─────────────────────────────────────────
     log(f"\n{'='*60}")
@@ -886,11 +957,10 @@ def run(posts_to_create=POSTS_PER_RUN, dry_run=False):
 # ============================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Auto WordPress Post Creator v17")
-    parser.add_argument("--posts",   type=int,           default=POSTS_PER_RUN, help="Number of posts to create")
-    parser.add_argument("--dry-run", action="store_true",                        help="Preview without posting to WordPress")
+    parser = argparse.ArgumentParser(description="Auto WordPress Post Creator v18")
+    parser.add_argument("--posts",      type=int,            default=POSTS_PER_RUN, help="Number of posts to create")
+    parser.add_argument("--dry-run",    action="store_true",                        help="Preview without posting to WordPress")
+    parser.add_argument("--skip-sleep", action="store_true",                        help="Skip random STARTUP sleep only. Post gap is always applied.")
     args = parser.parse_args()
 
-
-    run(posts_to_create=args.posts, dry_run=args.dry_run)
-
+    run(posts_to_create=args.posts, dry_run=args.dry_run, skip_sleep=args.skip_sleep)
